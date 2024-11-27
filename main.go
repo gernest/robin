@@ -188,6 +188,7 @@ func (ba *batch) saveColumn(col column, ra *roaring.Bitmap) error {
 	if !ra.Any() {
 		return nil
 	}
+	ra.Optimize()
 	ba.key.Set(col, ba.shard, 0)
 	itr, _ := ra.Containers.Iterator(0)
 	for itr.Next() {
