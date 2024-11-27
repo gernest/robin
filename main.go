@@ -65,8 +65,7 @@ func indexCommand(dataPath string, measurementsPath string) {
 		station := line[:semicolon]
 		ba.Add(id, station, int64(temp))
 	}
-	ba.save()
-	ba.ba.Close()
+	ba.Finish()
 	die(db.Compact([]byte{0}, []byte{byte(shards + 1)}, true))("running compaction")
 }
 
@@ -161,6 +160,7 @@ func (ba *batch) Finish() {
 	ba.shards.WriteTo(&b)
 	die(ba.ba.Set([]byte{byte(shards)}, b.Bytes(), nil))("saving shards index")
 	ba.save()
+	ba.ba.Close()
 }
 
 func (ba *batch) save() {
