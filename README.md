@@ -5,7 +5,7 @@ Go implementation for [ 1 Billlion rows challenge](https://1brc.dev/) using  [pe
 
 ## Why ?
 
-We use roaring bitmaps as storage format form  [vince](https://www.vinceanalytics.com/) - A self hosted alternative to Google analytics. We needed a sample application to validate our choice.
+We use roaring bitmaps as storage format for  [vince](https://www.vinceanalytics.com/) - A self hosted alternative to Google analytics. We needed a sample application to validate our choice.
 
 This challenge has very similar use case like vince, we have two columns, one for weather stations (with low cardinality) and another for values (with high cardinality).
 
