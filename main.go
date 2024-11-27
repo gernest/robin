@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"math"
 	"math/bits"
 	"os"
+	"sync"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/gernest/roaring"
@@ -26,11 +28,121 @@ func main() {
 	}
 }
 
+type query struct {
+	db *pebble.DB
+}
+
+func (q *query) aggregate(station string) aggr {
+	rowId := q.tr(station)
+	it := die2(q.db.NewIter(nil))("creating iterator for shards")
+	// compute all shards that contain station
+	cu := newIter(it)
+	cu.reset(shards)
+	all := cu.Row(rowId)
+	it.Close() // release early , we no longer use it
+	aggShard := func(shard uint64) aggr {
+		return q.aggregateShard(shard, rowId)
+	}
+	return mapShards(all, aggShard, reduceAggr)
+}
+
+func mapShards[T any](ra *roaring.Bitmap, fn func(uint64) T, re func(T, T) T) T {
+	result, compute := reduce(re)
+	var wg sync.WaitGroup
+	ra.ForEach(func(u uint64) error {
+		go func(shard uint64) {
+			wg.Add(1)
+			defer wg.Done()
+			result <- fn(shard)
+		}(u)
+		return nil
+	})
+	wg.Wait()
+	close(result)
+	return compute(context.Background())
+}
+
+func reduceAggr(old, new aggr) aggr {
+	return aggr{
+		Min:   min(old.Min, new.Min),
+		Max:   max(old.Max, new.Max),
+		Count: old.Count + new.Count,
+		Total: old.Total + new.Total,
+	}
+}
+
+func (q *query) tr(key string) uint64 {
+	value, done := die3(q.db.Get(makeTranslationKey([]byte(key))))("reading translation key for station %q", key)
+	defer done.Close()
+	return binary.BigEndian.Uint64(value)
+}
+
+func (q *query) aggregateShard(shard uint64, station uint64) (r aggr) {
+	it := die2(q.db.NewIter(nil))("creating iterator")
+	defer it.Close()
+	cu := &iter{it: it, shard: shard}
+
+	// first find all rows matching the station
+	if !cu.reset(weather) {
+		return
+	}
+	match := cu.Row(station)
+	if !match.Any() {
+		return
+	}
+
+	// compute total and sum
+	if !cu.reset(measure) {
+		return
+	}
+
+	r.Count, r.Total = cu.Sum(match)
+
+	// compute min and max
+
+	bitDepth := cu.BitLen()
+	r.Min, _ = cu.min(match, bitDepth)
+	r.Max, _ = cu.max(match, bitDepth)
+	return
+}
+
+const (
+	bsiExistsBit = 0
+	bsiSignBit   = 1
+	bsiOffsetBit = 2
+)
+
+type aggr struct {
+	Min, Max, Total int64
+	Count           int32
+}
+
+func reduce[T any](fn func(old, new T) T) (chan T, func(ctx context.Context) T) {
+	o := make(chan T, 1)
+	return o, func(ctx context.Context) (r T) {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case v, ok := <-o:
+				if !ok {
+					return
+				}
+				r = fn(r, v)
+			}
+		}
+	}
+}
+
 type iter struct {
 	lo    dataKey
 	hi    dataKey
 	it    *pebble.Iterator
 	shard uint64
+}
+
+func newIter(it *pebble.Iterator) *iter {
+	return &iter{it: it}
 }
 
 func (i *iter) reset(co column) bool {
@@ -50,6 +162,76 @@ func (i *iter) Next() bool {
 
 func (i *iter) BitLen() uint64 {
 	return i.Max() / shardwidth.ShardWidth
+}
+
+func (i *iter) min(filter *roaring.Bitmap, bitDepth uint64) (min int64, count uint64) {
+	consider := i.Row(bsiExistsBit)
+	if filter != nil {
+		consider = consider.Intersect(filter)
+	}
+	if !consider.Any() {
+		return
+	}
+	row := i.Row(bsiSignBit)
+	row = consider.Intersect(row)
+	if row.Any() {
+		min, count = i.maxUnsigned(row, bitDepth)
+		return -min, count
+	}
+	return i.minUnsigned(consider, bitDepth)
+}
+
+func (i *iter) max(filter *roaring.Bitmap, bitDepth uint64) (max int64, count uint64) {
+	consider := i.Row(bsiExistsBit)
+	if filter != nil {
+		consider = consider.Intersect(filter)
+	}
+	if !consider.Any() {
+		return
+	}
+	row := i.Row(bsiSignBit)
+	pos := consider.Difference(row)
+	if !pos.Any() {
+		max, count := i.minUnsigned(consider, bitDepth)
+		return -max, count
+	}
+	return i.maxUnsigned(pos, bitDepth)
+}
+
+func (i *iter) minUnsigned(filter *roaring.Bitmap, bitDepth uint64) (min int64, count uint64) {
+	count = filter.Count()
+	for n := int(bitDepth - 1); n >= 0; n-- {
+		row := i.Row(uint64(bsiOffsetBit + n))
+
+		row = filter.Difference(row)
+		count = row.Count()
+		if count > 0 {
+			filter = row
+		} else {
+			min += (1 << uint(n))
+			if n == 0 {
+				count = filter.Count()
+			}
+		}
+	}
+	return
+}
+
+func (i *iter) maxUnsigned(filter *roaring.Bitmap, bitDepth uint64) (max int64, count uint64) {
+	count = filter.Count()
+	for n := int(bitDepth - 1); n >= 0; n-- {
+		row := i.Row(uint64(bsiOffsetBit + n))
+		row = row.Intersect(filter)
+
+		count = row.Count()
+		if count > 0 {
+			max += (1 << uint(n))
+			filter = row
+		} else if n == 0 {
+			count = filter.Count()
+		}
+	}
+	return
 }
 
 func (i *iter) Value() (uint64, *roaring.Container) {
@@ -418,5 +600,16 @@ func die2[T any](v T, err error) func(msg string, args ...any) T {
 			os.Exit(1)
 		}
 		return v
+	}
+}
+
+func die3[T, K any](a T, b K, err error) func(msg string, args ...any) (T, K) {
+	return func(msg string, args ...any) (T, K) {
+		if err != nil {
+			reason := fmt.Sprintf(msg, args...)
+			slog.Error(reason, "err", err)
+			os.Exit(1)
+		}
+		return a, b
 	}
 }
