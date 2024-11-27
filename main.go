@@ -1,12 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"flag"
 	"fmt"
 	"hash/maphash"
-	"io"
 	"log/slog"
 	"math"
 	"math/bits"
@@ -23,6 +23,7 @@ func main() {
 
 	switch flag.Arg(0) {
 	case "index":
+		fmt.Println(flag.Arg(1), flag.Arg(2))
 		indexCommand(flag.Arg(1), flag.Arg(2))
 	}
 }
@@ -36,57 +37,36 @@ func indexCommand(dataPath string, measurementsPath string) {
 	file := die2(os.Open(measurementsPath))("opening measument file")
 	defer file.Close()
 
-	buf := make([]byte, 1024*1024)
-	readStart := 0
-	sep := []byte(":")
 	var id uint64
-	for {
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
 		id++
-		n, err := file.Read(buf[readStart:])
-		if err != nil && err != io.EOF {
-			die(err)("reading data")
-		}
-		if readStart+n == 0 {
-			break
-		}
-		chunk := buf[:readStart+n]
+		line := scanner.Bytes()
 
-		newline := bytes.LastIndexByte(chunk, '\n')
-		if newline < 0 {
-			break
-		}
-		remaining := chunk[newline+1:]
-		chunk = chunk[:newline+1]
-
-		station, tempBytes, hasSemi := bytes.Cut(chunk, sep)
-		if !hasSemi {
-			continue
-		}
-		negative := false
-		index := 0
-		if tempBytes[index] == '-' {
-			index++
-			negative = true
-		}
-		temp := float64(tempBytes[index] - '0')
-		index++
-		if tempBytes[index] != '.' {
-			temp = temp*10 + float64(tempBytes[index]-'0')
-			index++
-		}
-		index++ // skip '.'
-		temp += float64(tempBytes[index]-'0') / 10
-		if negative {
-			temp = -temp
-		}
-		if id == 5 {
-			os.Exit(1)
+		end := len(line)
+		tenths := int32(line[end-1] - '0')
+		ones := int32(line[end-3] - '0') // line[end-2] is '.'
+		var temp int32
+		var semicolon int
+		if line[end-4] == ';' {
+			temp = ones*10 + tenths
+			semicolon = end - 4
+		} else if line[end-4] == '-' {
+			temp = -(ones*10 + tenths)
+			semicolon = end - 5
 		} else {
-			fmt.Println(string(station), temp)
-			continue
+			tens := int32(line[end-4] - '0')
+			if line[end-5] == ';' {
+				temp = tens*100 + ones*10 + tenths
+				semicolon = end - 5
+			} else { // '-'
+				temp = -(tens*100 + ones*10 + tenths)
+				semicolon = end - 6
+			}
 		}
+
+		station := line[:semicolon]
 		ba.Add(id, station, int64(temp))
-		readStart = copy(buf, remaining)
 	}
 	ba.save()
 	ba.ba.Close()
@@ -108,7 +88,7 @@ const (
 	data prefix = 1 + iota
 	translateID
 	translateKey
-	shardCount
+	shards
 )
 
 type column byte
@@ -153,11 +133,12 @@ type batch struct {
 		weather *roaring.Bitmap
 		measure *roaring.Bitmap
 	}
-	db    *pebble.DB
-	ba    *pebble.Batch
-	key   dataKey
-	buf   bytes.Buffer
-	shard uint64
+	shards *roaring.Bitmap
+	db     *pebble.DB
+	ba     *pebble.Batch
+	key    dataKey
+	buf    bytes.Buffer
+	shard  uint64
 }
 
 const zeroSHard = ^uint64(0)
@@ -171,22 +152,35 @@ func newBatch(db *pebble.DB) *batch {
 	}
 	b.columns.weather = roaring.NewBitmap()
 	b.columns.measure = roaring.NewBitmap()
+	b.shards = roaring.NewBitmap()
 	return b
 }
 
 func (ba *batch) Add(id uint64, station []byte, measure int64) {
 	shard := id / shardwidth.ShardWidth
 	if shard != ba.shard {
+		if ba.shard != zeroSHard {
+			ba.save()
+		}
 		ba.shard = shard
 	}
 	ba.writeWeather(id, station)
 	ba.writeMeasure(id, measure)
 }
 
+func (ba *batch) Finish() {
+	var b bytes.Buffer
+	ba.shards.WriteTo(&b)
+	die(ba.ba.Set([]byte{byte(shards)}, b.Bytes(), nil))("saving shards index")
+	ba.save()
+}
+
 func (ba *batch) save() {
 	die(ba.saveColumn(weather, ba.columns.weather))("saving weather")
 	die(ba.saveColumn(measure, ba.columns.measure))("saving measure")
 	die(ba.ba.Commit(nil))("commit batch")
+	ba.columns.weather.Containers.Reset()
+	ba.columns.measure.Containers.Reset()
 	ba.ba = ba.db.NewBatch()
 }
 
@@ -209,7 +203,14 @@ func (ba *batch) saveColumn(col column, ra *roaring.Bitmap) error {
 
 func (ba *batch) writeWeather(id uint64, station []byte) {
 	value := ba.tr.Translate(ba.ba, station)
-	ba.columns.weather.DirectAdd(
+	encodeCard(ba.columns.weather, id, value)
+
+	// track which shards the weather station was found
+	encodeCard(ba.shards, ba.shard, value)
+}
+
+func encodeCard(ra *roaring.Bitmap, id uint64, value uint64) {
+	ra.DirectAdd(
 		value*shardwidth.ShardWidth +
 			(id % shardwidth.ShardWidth),
 	)
