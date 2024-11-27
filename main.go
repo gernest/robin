@@ -71,6 +71,12 @@ func (i *iter) Max() uint64 {
 	return uint64((ck << 16) | uint64(value))
 }
 
+func (i *iter) Sum(filter *roaring.Bitmap) (count int32, total int64) {
+	fs := roaring.NewBitmapBSICountFilter(filter)
+	i.ApplyFilter(0, fs)
+	return fs.Total()
+}
+
 func (i *iter) Row(rowID uint64) *roaring.Bitmap {
 	return i.OffsetRange(
 		shardwidth.ShardWidth*i.shard,
