@@ -8,10 +8,8 @@ import (
 	"fmt"
 	"hash/maphash"
 	"log/slog"
-	"math"
 	"math/bits"
 	"os"
-	"unsafe"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/gernest/roaring"
@@ -25,12 +23,6 @@ func main() {
 	case "index":
 		indexCommand(flag.Arg(1), flag.Arg(2))
 	}
-}
-
-func compact(dataPath string) {
-	db := die2(pebble.Open(dataPath, nil))("creating idex database path=%q", dataPath)
-	defer db.Close()
-	die(db.Compact([]byte{0}, []byte{byte(shards + 1)}, true))("running compaction")
 }
 
 func indexCommand(dataPath string, measurementsPath string) {
@@ -76,16 +68,6 @@ func indexCommand(dataPath string, measurementsPath string) {
 	ba.save()
 	ba.ba.Close()
 	die(db.Compact([]byte{0}, []byte{byte(shards + 1)}, true))("running compaction")
-}
-
-// FromFloat64 converts a float into a Decimal.
-func FromFloat64(f float64) int64 {
-	us := int64(f * math.Pow(10, 2))
-	return us
-}
-
-func toStr(b []byte) string {
-	return unsafe.String(&b[0], len(b))
 }
 
 type prefix byte
