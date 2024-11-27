@@ -23,9 +23,14 @@ func main() {
 
 	switch flag.Arg(0) {
 	case "index":
-		fmt.Println(flag.Arg(1), flag.Arg(2))
 		indexCommand(flag.Arg(1), flag.Arg(2))
 	}
+}
+
+func compact(dataPath string) {
+	db := die2(pebble.Open(dataPath, nil))("creating idex database path=%q", dataPath)
+	defer db.Close()
+	die(db.Compact([]byte{0}, []byte{byte(shards + 1)}, true))("running compaction")
 }
 
 func indexCommand(dataPath string, measurementsPath string) {
@@ -70,6 +75,7 @@ func indexCommand(dataPath string, measurementsPath string) {
 	}
 	ba.save()
 	ba.ba.Close()
+	die(db.Compact([]byte{0}, []byte{byte(shards + 1)}, true))("running compaction")
 }
 
 // FromFloat64 converts a float into a Decimal.
