@@ -11,11 +11,11 @@ import (
 	"io"
 	giter "iter"
 	"log/slog"
-	"maps"
 	"math"
 	"math/bits"
 	"os"
 	"runtime"
+	"sort"
 	"sync"
 	"text/tabwriter"
 	"time"
@@ -25,7 +25,13 @@ import (
 	"github.com/gernest/roaring/shardwidth"
 )
 
+var limit = flag.Int("limit", 0, "limits result returned")
+
 func main() {
+	start := time.Now()
+	defer func() {
+		fmt.Println("elapsed", time.Since(start))
+	}()
 	flag.Parse()
 
 	switch flag.Arg(0) {
@@ -94,7 +100,6 @@ func (q *query) aggrMany(rows *roaring.Bitmap) many {
 }
 
 func (q *query) oneAggr(station string) aggr {
-	start := time.Now()
 	rowId := q.tr(station)
 	it := die2(q.db.NewIter(nil))("creating iterator for shards")
 	// compute all shards that contain station
@@ -106,7 +111,6 @@ func (q *query) oneAggr(station string) aggr {
 		return q.one(shard, rowId)
 	}
 	a := mapShards(all, aggShard, reduceAggr)
-	a.elapsed = time.Since(start)
 	return a
 }
 
@@ -215,6 +219,7 @@ func (q *query) many(rows *roaring.Bitmap) func(shard uint64) (r many) {
 	return func(shard uint64) (r many) {
 		r = many{}
 		it := die2(q.db.NewIter(nil))("creating iterator")
+		defer it.Close()
 		cu := newIter(it, shard)
 		cu.reset(weather)
 		match := make([]*rowMatch, 0, 1<<10)
@@ -229,29 +234,11 @@ func (q *query) many(rows *roaring.Bitmap) func(shard uint64) (r many) {
 
 		cu.reset(measure)
 		bitDepth := cu.BitLen()
-		it.Close()
 
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-		for work := range chunk(match, runtime.NumCPU()) {
-			wg.Add(1)
-			go func(work []*rowMatch) {
-				defer wg.Done()
-				wit := die2(q.db.NewIter(nil))("creating iterator")
-				defer wit.Close()
-				cu := newIter(wit, shard)
-				ma := map[uint64]*aggr{}
-				cu.reset(measure)
-				for _, rm := range work {
-					rs := cuArg(cu, rm.match, bitDepth)
-					ma[rm.row] = rs
-				}
-				mu.Lock()
-				maps.Copy(r, ma)
-				mu.Unlock()
-			}(work)
+		for _, rm := range match {
+			rs := cuArg(cu, rm.match, bitDepth)
+			r[rm.row] = rs
 		}
-		wg.Wait()
 		return
 	}
 }
@@ -302,7 +289,6 @@ const (
 )
 
 type aggr struct {
-	elapsed         time.Duration
 	Min, Max, Total int64
 	Count           int32
 }
@@ -310,10 +296,18 @@ type aggr struct {
 type resultSet []*result
 
 func (r resultSet) Format(out io.Writer) {
+	sort.Slice(r, func(i, j int) bool {
+		return r[i].name < r[j].name
+	})
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 0, ' ', tabwriter.AlignRight)
 	fmt.Fprintln(w, " station \tmin \tmean \tmax \telapsed\t")
-	for _, c := range r {
-		fmt.Fprintf(w, "%s \t%.1f \t%.1f \t%.1f \t%s\t\n", c.name, c.min, c.mean, c.max, c.elapsed)
+	n := len(r)
+	if *limit > 0 {
+		n = min(*limit, len(r))
+	}
+	for i := 0; i < n; i++ {
+		c := r[i]
+		fmt.Fprintf(w, "%s \t%.1f \t%.1f \t%.1f \t\n", c.name, c.min, c.mean, c.max)
 	}
 	w.Flush()
 }
@@ -321,11 +315,10 @@ func (r resultSet) Format(out io.Writer) {
 type result struct {
 	name           string
 	mean, min, max float64
-	elapsed        time.Duration
 }
 
 func (a aggr) Result(name string) (r *result) {
-	r = &result{name: name, elapsed: a.elapsed}
+	r = &result{name: name}
 	r.mean = float64(a.Total) / float64(a.Count) / 10
 	r.min = float64(a.Min) / 10
 	r.max = float64(a.Max) / 10
