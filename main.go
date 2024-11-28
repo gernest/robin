@@ -730,7 +730,7 @@ func (tr *tr) Translate(ba *pebble.Batch, value []byte) uint64 {
 	tr.keys(value)
 
 	die(ba.Set(tr.buf.id[:], value, nil))("creating translation id")
-	die(ba.Set(tr.buf.key, value, nil))("creating translation key")
+	die(ba.Set(tr.buf.key, tr.buf.id[1:], nil))("creating translation key")
 	tr.values[hash] = tr.id
 	return tr.id
 }
