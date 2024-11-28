@@ -1,4 +1,4 @@
-module github.com/vinceanalytics/robin
+module github.com/gernest/robin
 
 go 1.23.2
 
