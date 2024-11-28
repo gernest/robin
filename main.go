@@ -9,10 +9,13 @@ import (
 	"fmt"
 	"hash/maphash"
 	"io"
+	giter "iter"
 	"log/slog"
+	"maps"
 	"math"
 	"math/bits"
 	"os"
+	"runtime"
 	"sync"
 	"text/tabwriter"
 	"time"
@@ -63,6 +66,7 @@ func (q *query) All() (r []*result) {
 	mapping := map[uint64]string{}
 	it := die2(q.db.NewIter(nil))("creating iterator for shards")
 	prefix := []byte{byte(translateID)}
+	rows := roaring.NewBitmap()
 	for it.SeekGE(prefix); it.Valid(); it.Next() {
 		key := it.Key()
 		if !bytes.HasPrefix(key, prefix) {
@@ -70,9 +74,10 @@ func (q *query) All() (r []*result) {
 		}
 		id := binary.BigEndian.Uint64(key[1:])
 		mapping[id] = string(it.Value())
+		rows.Add(id)
 	}
 	it.Close()
-	all := q.aggrMany()
+	all := q.aggrMany(rows)
 	r = make([]*result, 0, len(all))
 	for k, v := range all {
 		r = append(r, v.Result(mapping[k]))
@@ -80,12 +85,12 @@ func (q *query) All() (r []*result) {
 	return r
 }
 
-func (q *query) aggrMany() many {
+func (q *query) aggrMany(rows *roaring.Bitmap) many {
 	value, done := die3(q.db.Get([]byte{byte(shardCount)}))("reading shard count")
 	all := roaring.NewBitmap()
 	die(all.UnmarshalBinary(value))("decoding shards")
 	done.Close()
-	return mapShards(all, q.many, reduceMany)
+	return mapShards(all, q.many(rows), reduceMany)
 }
 
 func (q *query) oneAggr(station string) aggr {
@@ -93,7 +98,7 @@ func (q *query) oneAggr(station string) aggr {
 	rowId := q.tr(station)
 	it := die2(q.db.NewIter(nil))("creating iterator for shards")
 	// compute all shards that contain station
-	cu := newIter(it)
+	cu := newIter(it, 0)
 	cu.reset(shards)
 	all := cu.Row(rowId)
 	it.Close() // release early , we no longer use it
@@ -105,17 +110,26 @@ func (q *query) oneAggr(station string) aggr {
 	return a
 }
 
-func mapShards[T any](ra *roaring.Bitmap, fn func(uint64) T, re func(T, T) T) T {
+func mapShards[T any](ra *roaring.Bitmap, fn func(uint64) T, re func(T, T) T) (r T) {
 	result, compute := reduce(re)
 	var wg sync.WaitGroup
+
+	shards := make([]uint64, 0, ra.Count())
 	ra.ForEach(func(u uint64) error {
-		go func(shard uint64) {
-			wg.Add(1)
-			defer wg.Done()
-			result <- fn(shard)
-		}(u)
+		shards = append(shards, u)
 		return nil
 	})
+
+	for work := range chunk(shards, runtime.NumCPU()) {
+		wg.Add(1)
+		go func(work []uint64) {
+			defer wg.Done()
+			for _, shard := range work {
+				result <- fn(shard)
+			}
+		}(work)
+	}
+
 	go func() {
 		// We don't want to block compute, so we wait on a separate goroutine.
 		// compute will exit after we close result.
@@ -123,6 +137,27 @@ func mapShards[T any](ra *roaring.Bitmap, fn func(uint64) T, re func(T, T) T) T 
 		close(result)
 	}()
 	return compute(context.Background())
+}
+
+func chunk[S ~[]E, E any](slice S, n int) giter.Seq[S] {
+	if n < 1 {
+		panic(fmt.Sprintf("attempted to divide a slice by n < 1: n = %d", n))
+	}
+	return func(yield func(S) bool) {
+		size := len(slice) / n
+		remainder := len(slice) % n
+		var start, end int
+		for range n {
+			start, end = end, end+size
+			if remainder > 0 {
+				remainder--
+				end++
+			}
+			if !yield(slice[start:end:end]) {
+				return
+			}
+		}
+	}
 }
 
 var zeroAggr aggr
@@ -176,51 +211,68 @@ func reduceAggrPtr(old, new *aggr) *aggr {
 	}
 }
 
-func (q *query) many(shard uint64) (r many) {
-	it := die2(q.db.NewIter(nil))("creating iterator")
-	defer it.Close()
-	cu := &iter{it: it, shard: shard}
-	r = make(many)
-	// first find all rows matching the station
-	if !cu.reset(weather) {
+func (q *query) many(rows *roaring.Bitmap) func(shard uint64) (r many) {
+	return func(shard uint64) (r many) {
+		r = many{}
+		it := die2(q.db.NewIter(nil))("creating iterator")
+		cu := newIter(it, shard)
+		cu.reset(weather)
+		match := make([]*rowMatch, 0, 1<<10)
+		itr := rows.Iterator()
+		itr.Seek(0)
+		for v, eof := itr.Next(); !eof; v, eof = itr.Next() {
+			match = append(match, &rowMatch{
+				row:   v,
+				match: cu.Row(v),
+			})
+		}
+
+		cu.reset(measure)
+		bitDepth := cu.BitLen()
+		it.Close()
+
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		for work := range chunk(match, runtime.NumCPU()) {
+			wg.Add(1)
+			go func(work []*rowMatch) {
+				defer wg.Done()
+				wit := die2(q.db.NewIter(nil))("creating iterator")
+				defer wit.Close()
+				cu := newIter(wit, shard)
+				ma := map[uint64]*aggr{}
+				cu.reset(measure)
+				for _, rm := range work {
+					rs := cuArg(cu, rm.match, bitDepth)
+					ma[rm.row] = rs
+				}
+				mu.Lock()
+				maps.Copy(r, ma)
+				mu.Unlock()
+			}(work)
+		}
+		wg.Wait()
 		return
 	}
-	// collect containers for each row
-	m := map[uint64]*roaring.Container{}
-	for ; cu.Valid(); cu.Next() {
-		k, v := cu.Value()
-		m[k>>4] = v.Clone()
-	}
+}
 
-	match := roaring.NewBitmap()
-	resultContainerKey := shard * 16
-
-	// compute total and sum
-	if !cu.reset(measure) {
-		return
-	}
-	bitDepth := cu.BitLen()
-
-	for row, matchContainer := range m {
-		match.Containers.Reset()
-		match.Containers.Put(resultContainerKey, matchContainer)
-		var rm aggr
-
-		rm.Count, rm.Total = cu.Sum(match)
-
-		// compute min and max
-
-		rm.Min, _ = cu.min(match, bitDepth)
-		rm.Max, _ = cu.max(match, bitDepth)
-		r[row] = &rm
-	}
+func cuArg(cu *iter, match *roaring.Bitmap, bitDepth uint64) (r *aggr) {
+	r = &aggr{}
+	r.Count, r.Total = cu.Sum(match)
+	r.Min, _ = cu.min(match, bitDepth)
+	r.Max, _ = cu.max(match, bitDepth)
 	return
+}
+
+type rowMatch struct {
+	row   uint64
+	match *roaring.Bitmap
 }
 
 func (q *query) one(shard uint64, station uint64) (r aggr) {
 	it := die2(q.db.NewIter(nil))("creating iterator")
 	defer it.Close()
-	cu := &iter{it: it, shard: shard}
+	cu := newIter(it, shard)
 
 	// first find all rows matching the station
 	if !cu.reset(weather) {
@@ -236,11 +288,8 @@ func (q *query) one(shard uint64, station uint64) (r aggr) {
 		return
 	}
 
-	r.Count, r.Total = cu.Sum(match)
-
-	// compute min and max
-
 	bitDepth := cu.BitLen()
+	r.Count, r.Total = cu.Sum(match)
 	r.Min, _ = cu.min(match, bitDepth)
 	r.Max, _ = cu.max(match, bitDepth)
 	return
@@ -307,8 +356,8 @@ type iter struct {
 	shard uint64
 }
 
-func newIter(it *pebble.Iterator) *iter {
-	return &iter{it: it}
+func newIter(it *pebble.Iterator, shard uint64) *iter {
+	return &iter{it: it, shard: shard}
 }
 
 func (i *iter) reset(co column) bool {
