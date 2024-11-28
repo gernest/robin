@@ -15,6 +15,7 @@ import (
 	"os"
 	"sync"
 	"text/tabwriter"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/gernest/roaring"
@@ -88,6 +89,7 @@ func (q *query) aggrMany() many {
 }
 
 func (q *query) oneAggr(station string) aggr {
+	start := time.Now()
 	rowId := q.tr(station)
 	it := die2(q.db.NewIter(nil))("creating iterator for shards")
 	// compute all shards that contain station
@@ -98,7 +100,9 @@ func (q *query) oneAggr(station string) aggr {
 	aggShard := func(shard uint64) aggr {
 		return q.one(shard, rowId)
 	}
-	return mapShards(all, aggShard, reduceAggr)
+	a := mapShards(all, aggShard, reduceAggr)
+	a.elapsed = time.Since(start)
+	return a
 }
 
 func mapShards[T any](ra *roaring.Bitmap, fn func(uint64) T, re func(T, T) T) T {
@@ -249,6 +253,7 @@ const (
 )
 
 type aggr struct {
+	elapsed         time.Duration
 	Min, Max, Total int64
 	Count           int32
 }
@@ -257,9 +262,9 @@ type resultSet []*result
 
 func (r resultSet) Format(out io.Writer) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 0, ' ', tabwriter.AlignRight)
-	fmt.Fprintln(w, " station \tmin \tmean \tmax")
+	fmt.Fprintln(w, " station \tmin \tmean \tmax \telapsed\t")
 	for _, c := range r {
-		fmt.Fprintf(w, "%s \t%.1f \t%.1f \t%.1f\t\n", c.name, c.min, c.mean, c.max)
+		fmt.Fprintf(w, "%s \t%.1f \t%.1f \t%.1f \t%s\t\n", c.name, c.min, c.mean, c.max, c.elapsed)
 	}
 	w.Flush()
 }
@@ -267,10 +272,11 @@ func (r resultSet) Format(out io.Writer) {
 type result struct {
 	name           string
 	mean, min, max float64
+	elapsed        time.Duration
 }
 
 func (a aggr) Result(name string) (r *result) {
-	r = &result{name: name}
+	r = &result{name: name, elapsed: a.elapsed}
 	r.mean = float64(a.Total) / float64(a.Count) / 10
 	r.min = float64(a.Min) / 10
 	r.max = float64(a.Max) / 10
