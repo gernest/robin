@@ -8,11 +8,13 @@ import (
 	"flag"
 	"fmt"
 	"hash/maphash"
+	"io"
 	"log/slog"
 	"math"
 	"math/bits"
 	"os"
 	"sync"
+	"text/tabwriter"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/gernest/roaring"
@@ -25,6 +27,8 @@ func main() {
 	switch flag.Arg(0) {
 	case "index":
 		indexCommand(flag.Arg(1), flag.Arg(2))
+	case "query":
+		doQuery(flag.Arg(1), flag.Arg(2))
 	}
 }
 
@@ -32,7 +36,58 @@ type query struct {
 	db *pebble.DB
 }
 
-func (q *query) aggregate(station string) aggr {
+func doQuery(dataPath string, station string) {
+	db := die2(pebble.Open(dataPath, &pebble.Options{
+		Logger: noopLogger{},
+	}))("opening index database path=%q", dataPath)
+	defer db.Close()
+	q := &query{db: db}
+	if station != "" {
+		resultSet{q.One(station)}.Format(os.Stdout)
+		return
+	}
+	resultSet(q.All()).Format(os.Stdout)
+}
+
+type noopLogger struct{}
+
+func (noopLogger) Fatalf(format string, args ...interface{}) {}
+func (noopLogger) Infof(format string, args ...interface{})  {}
+
+func (q *query) One(name string) *result {
+	return q.oneAggr(name).Result(name)
+}
+
+func (q *query) All() (r []*result) {
+	mapping := map[uint64]string{}
+	it := die2(q.db.NewIter(nil))("creating iterator for shards")
+	prefix := []byte{byte(translateID)}
+	for it.SeekGE(prefix); it.Valid(); it.Next() {
+		key := it.Value()
+		if !bytes.HasPrefix(key, prefix) {
+			break
+		}
+		id := binary.BigEndian.Uint64(key[1:])
+		mapping[id] = string(it.Value())
+	}
+	it.Close()
+	all := q.aggrMany()
+	r = make([]*result, 0, len(all))
+	for k, v := range all {
+		r = append(r, v.Result(mapping[k]))
+	}
+	return r
+}
+
+func (q *query) aggrMany() many {
+	value, done := die3(q.db.Get([]byte{byte(shardCount)}))("reading shard count")
+	all := roaring.NewBitmap()
+	die(all.UnmarshalBinary(value))("decoding shards")
+	done.Close()
+	return mapShards(all, q.many, reduceMany)
+}
+
+func (q *query) oneAggr(station string) aggr {
 	rowId := q.tr(station)
 	it := die2(q.db.NewIter(nil))("creating iterator for shards")
 	// compute all shards that contain station
@@ -41,7 +96,7 @@ func (q *query) aggregate(station string) aggr {
 	all := cu.Row(rowId)
 	it.Close() // release early , we no longer use it
 	aggShard := func(shard uint64) aggr {
-		return q.aggregateShard(shard, rowId)
+		return q.one(shard, rowId)
 	}
 	return mapShards(all, aggShard, reduceAggr)
 }
@@ -66,7 +121,15 @@ func mapShards[T any](ra *roaring.Bitmap, fn func(uint64) T, re func(T, T) T) T 
 	return compute(context.Background())
 }
 
+var zeroAggr aggr
+
 func reduceAggr(old, new aggr) aggr {
+	if old == zeroAggr {
+		return new
+	}
+	if new == zeroAggr {
+		return old
+	}
 	return aggr{
 		Min:   min(old.Min, new.Min),
 		Max:   max(old.Max, new.Max),
@@ -81,7 +144,76 @@ func (q *query) tr(key string) uint64 {
 	return binary.BigEndian.Uint64(value)
 }
 
-func (q *query) aggregateShard(shard uint64, station uint64) (r aggr) {
+type many map[uint64]*aggr
+
+func reduceMany(old, new many) (m many) {
+	if old == nil {
+		return new
+	}
+	m = make(many)
+	for k := range old {
+		m[k] = reduceAggrPtr(old[k], new[k])
+	}
+	return
+}
+
+func reduceAggrPtr(old, new *aggr) *aggr {
+	if old == nil {
+		return new
+	}
+	if new == nil {
+		return old
+	}
+	return &aggr{
+		Min:   min(old.Min, new.Min),
+		Max:   max(old.Max, new.Max),
+		Count: old.Count + new.Count,
+		Total: old.Total + new.Total,
+	}
+}
+
+func (q *query) many(shard uint64) (r many) {
+	it := die2(q.db.NewIter(nil))("creating iterator")
+	defer it.Close()
+	cu := &iter{it: it, shard: shard}
+	r = make(many)
+	// first find all rows matching the station
+	if !cu.reset(weather) {
+		return
+	}
+	// collect containers for each row
+	m := map[uint64]*roaring.Container{}
+	for ; cu.Valid(); cu.Next() {
+		k, v := cu.Value()
+		m[k>>4] = v.Clone()
+	}
+
+	match := roaring.NewBitmap()
+	resultContainerKey := shard * 16
+
+	// compute total and sum
+	if !cu.reset(measure) {
+		return
+	}
+	bitDepth := cu.BitLen()
+
+	for row, matchContainer := range m {
+		match.Containers.Reset()
+		match.Containers.Put(resultContainerKey, matchContainer)
+		var rm aggr
+
+		rm.Count, rm.Total = cu.Sum(match)
+
+		// compute min and max
+
+		rm.Min, _ = cu.min(match, bitDepth)
+		rm.Max, _ = cu.max(match, bitDepth)
+		r[row] = &rm
+	}
+	return
+}
+
+func (q *query) one(shard uint64, station uint64) (r aggr) {
 	it := die2(q.db.NewIter(nil))("creating iterator")
 	defer it.Close()
 	cu := &iter{it: it, shard: shard}
@@ -121,10 +253,27 @@ type aggr struct {
 	Count           int32
 }
 
-func (a aggr) Result() (mean, min, max float64) {
-	mean = float64(a.Total) / float64(a.Count) / 10
-	min = float64(a.Min) / 10
-	max = float64(a.Max) / 10
+type resultSet []*result
+
+func (r resultSet) Format(out io.Writer) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 0, ' ', tabwriter.AlignRight)
+	fmt.Fprintln(w, " station \tmin \tmean \tmax")
+	for _, c := range r {
+		fmt.Fprintf(w, "%s \t%.1f \t%.1f \t%.1f\t\n", c.name, c.min, c.mean, c.max)
+	}
+	w.Flush()
+}
+
+type result struct {
+	name           string
+	mean, min, max float64
+}
+
+func (a aggr) Result(name string) (r *result) {
+	r = &result{name: name}
+	r.mean = float64(a.Total) / float64(a.Count) / 10
+	r.min = float64(a.Min) / 10
+	r.max = float64(a.Max) / 10
 	return
 }
 
@@ -389,7 +538,7 @@ func indexCommand(dataPath string, measurementsPath string) {
 		ba.Add(id, station, int64(temp))
 	}
 	ba.Finish()
-	die(db.Compact([]byte{0}, []byte{byte(translateKey + 1)}, true))("running compaction")
+	die(db.Compact([]byte{0}, []byte{byte(shardCount + 1)}, true))("running compaction")
 }
 
 type prefix byte
@@ -398,6 +547,7 @@ const (
 	data prefix = 1 + iota
 	translateID
 	translateKey
+	shardCount
 )
 
 type column byte
@@ -443,12 +593,13 @@ type batch struct {
 		weather *roaring.Bitmap
 		measure *roaring.Bitmap
 	}
-	shards *roaring.Bitmap
-	db     *pebble.DB
-	ba     *pebble.Batch
-	key    dataKey
-	buf    bytes.Buffer
-	shard  uint64
+	shards      *roaring.Bitmap
+	shardsCount *roaring.Bitmap
+	db          *pebble.DB
+	ba          *pebble.Batch
+	key         dataKey
+	buf         bytes.Buffer
+	shard       uint64
 }
 
 const zeroSHard = ^uint64(0)
@@ -463,6 +614,7 @@ func newBatch(db *pebble.DB) *batch {
 	b.columns.weather = roaring.NewBitmap()
 	b.columns.measure = roaring.NewBitmap()
 	b.shards = roaring.NewBitmap()
+	b.shardsCount = roaring.NewBitmap()
 	return b
 }
 
@@ -472,6 +624,7 @@ func (ba *batch) Add(id uint64, station []byte, measure int64) {
 		if ba.shard != zeroSHard {
 			ba.save()
 		}
+		ba.shardsCount.Add(shard)
 		ba.shard = shard
 	}
 	ba.writeWeather(id, station)
@@ -480,6 +633,9 @@ func (ba *batch) Add(id uint64, station []byte, measure int64) {
 
 func (ba *batch) Finish() {
 	ba.saveColumn(shards, ba.shards, 0)
+	var b bytes.Buffer
+	ba.shardsCount.WriteTo(&b)
+	die(ba.ba.Set([]byte{byte(shardCount)}, b.Bytes(), nil))("saving shard count")
 	ba.save()
 	ba.ba.Close()
 }
