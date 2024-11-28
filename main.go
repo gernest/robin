@@ -57,8 +57,12 @@ func mapShards[T any](ra *roaring.Bitmap, fn func(uint64) T, re func(T, T) T) T 
 		}(u)
 		return nil
 	})
-	wg.Wait()
-	close(result)
+	go func() {
+		// We don't want to block compute, so we wait on a separate goroutine.
+		// compute will exit after we close result.
+		wg.Wait()
+		close(result)
+	}()
 	return compute(context.Background())
 }
 
@@ -115,6 +119,13 @@ const (
 type aggr struct {
 	Min, Max, Total int64
 	Count           int32
+}
+
+func (a aggr) Result() (mean, min, max float64) {
+	mean = float64(a.Total) / float64(a.Count) / 10
+	min = float64(a.Min) / 10
+	max = float64(a.Max) / 10
+	return
 }
 
 func reduce[T any](fn func(old, new T) T) (chan T, func(ctx context.Context) T) {
