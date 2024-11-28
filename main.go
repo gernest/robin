@@ -26,7 +26,7 @@ func main() {
 
 	switch flag.Arg(0) {
 	case "index":
-		indexCommand(flag.Arg(1), flag.Arg(2))
+		doIndex(flag.Arg(1), flag.Arg(2))
 	case "query":
 		doQuery(flag.Arg(1), flag.Arg(2))
 	}
@@ -497,7 +497,7 @@ func (i *iter) OffsetRange(offset, start, endx uint64) *roaring.Bitmap {
 func highbits(v uint64) uint64 { return v >> 16 }
 func lowbits(v uint64) uint16  { return uint16(v & 0xFFFF) }
 
-func indexCommand(dataPath string, measurementsPath string) {
+func doIndex(dataPath string, measurementsPath string) {
 	db := die2(pebble.Open(dataPath, nil))("creating idex database path=%q", dataPath)
 	defer db.Close()
 
