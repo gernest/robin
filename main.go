@@ -64,7 +64,7 @@ func (q *query) All() (r []*result) {
 	it := die2(q.db.NewIter(nil))("creating iterator for shards")
 	prefix := []byte{byte(translateID)}
 	for it.SeekGE(prefix); it.Valid(); it.Next() {
-		key := it.Value()
+		key := it.Key()
 		if !bytes.HasPrefix(key, prefix) {
 			break
 		}
